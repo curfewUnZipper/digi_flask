@@ -2,4 +2,4 @@ flask
 pandas
 numpy
 joblib
-tf-keras
+onnxruntime
