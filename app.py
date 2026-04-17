@@ -5,14 +5,23 @@ from flask import Flask, request, jsonify
 import pandas as pd
 import numpy as np
 import joblib
-from tensorflow.keras.models import load_model
+import onnxruntime as ort
 
 app = Flask(__name__)
 
 # =========================
 # LOAD MODEL + SCALER
 # =========================
-model = load_model("lstm_model.h5", compile=False)
+class ONNXModelWrapper:
+    def __init__(self, model_path):
+        self.session = ort.InferenceSession(model_path)
+        self.input_name = self.session.get_inputs()[0].name
+
+    def predict(self, x, verbose=0):
+        return self.session.run(None, {self.input_name: np.array(x).astype(np.float32)})[0]
+
+# Drop-in replacement — nothing below changes
+model = ONNXModelWrapper("lstm_model.onnx")
 scaler = joblib.load("scaler.pkl")
 
 WINDOW = 50
