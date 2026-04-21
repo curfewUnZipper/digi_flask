@@ -1,80 +1,69 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import joblib
-import onnxruntime as ort
+from collections import deque
 
 app = Flask(__name__)
+CORS(app)
 
-# =========================
-# MODEL
-# =========================
-class ONNXModelWrapper:
-    def __init__(self, model_path):
-        self.session = ort.InferenceSession(model_path)
-        self.input_name = self.session.get_inputs()[0].name
+reg = joblib.load("fan_regressor_v4.pkl")
+stats = joblib.load("z_stats_v4.pkl")
+calib = joblib.load("calibration_v4.pkl")
 
-    def predict(self, x):
-        return self.session.run(None, {self.input_name: np.array(x).astype(np.float32)})[0]
+BUFFER = deque(maxlen=20)
 
-model = ONNXModelWrapper("lstm_model.onnx")
-scaler = joblib.load("scaler.pkl")
+BASE_FEATURES = ["cpu_usage","cpu_temp","gpu_temp","power","cpu_freq"]
 
-WINDOW = 50
-TOTAL_LIFE = 8 * 365 * 24 * 60 * 60
+import math
 
-features = [
-    "fan1","fan2",
-    "cpu_temp","gpu_temp","nvidia_temp",
-    "cpu_usage",
-    "current","power"
-]
+def compute_score(z_abs):
+    # log-based scaling (stable)
+    score = math.log1p(z_abs) * 40
+    return min(score, 100)
 
-# =========================
-# CORE
-# =========================
-def predict_rul_series(df):
+def get_health(score):
+    if score < 35:
+        return "Normal"
+    elif score < 70:
+        return "Degrading"
+    else:
+        return "Critical"
 
-    df = df.copy().fillna(0)
-    df[features] = scaler.transform(df[features])
-
-    rul_list = []
-
-    for i in range(len(df)):
-
-        if i < WINDOW:
-            rul_list.append(None)
-            continue
-
-        window = df[features].values[i-WINDOW:i]
-        window = np.expand_dims(window, axis=0)
-
-        pred = model.predict(window)[0][0]
-
-        rul_seconds = pred * TOTAL_LIFE
-        rul_hours = rul_seconds / 3600
-        rul_years = rul_seconds / (365 * 24 * 3600)
-
-        rul_list.append({
-            "normalized": float(pred),
-            "seconds": float(rul_seconds),
-            "hours": float(rul_hours),
-            "years": float(rul_years)
-        })
-
-    return rul_list
-
-# =========================
-# ROUTE
-# =========================
-@app.route("/api/predict", methods=["POST"])
+@app.route("/predict", methods=["POST"])
 def predict():
     data = request.json
-    df = pd.DataFrame(data)
+    df = pd.DataFrame([data])
 
-    rul_series = predict_rul_series(df)
+    # digital twin
+    df["predicted_fan"] = reg.predict(df[BASE_FEATURES])
 
-    return jsonify({"rul_series": rul_series})
+    df["fan_error"] = df["fan1"] - df["predicted_fan"]
 
-# IMPORTANT: export app
-handler = app
+    # load stats
+    load = data.get("load", "MED")  # default fallback
+    row = stats[stats["load"] == load].iloc[0]
+
+    z = (df["fan_error"][0] - row["mu"]) / row["sigma"]
+    z = np.clip(z, -5, 5)
+    z_abs = abs(z)
+
+    score = compute_score(z_abs)
+    # score = (z_abs / 5) * 100
+    health = get_health(score)
+
+    return jsonify({
+        "predicted_fan": float(df["predicted_fan"][0]),
+        "fan_error": float(df["fan_error"][0]),
+        "z_score": float(z),
+        "anomaly_score": float(score),
+        "health": health
+    })
+
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
