@@ -30,7 +30,11 @@ def get_health(score):
         return "Degrading"
     else:
         return "Critical"
-
+        
+@app.route("/health", methods=["GET"])
+def health():
+    return {"status": "ok"}, 200
+    
 @app.route("/predict", methods=["POST"])
 def predict():
     data = request.json
