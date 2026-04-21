@@ -4,24 +4,27 @@ import pandas as pd
 import numpy as np
 import joblib
 from collections import deque
+import math
+import os
 
 app = Flask(__name__)
 CORS(app)
 
-reg = joblib.load("fan_regressor_v4.pkl")
-stats = joblib.load("z_stats_v4.pkl")
-calib = joblib.load("calibration_v4.pkl")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+reg   = joblib.load(os.path.join(BASE_DIR, "fan_regressor_v4.pkl"))
+stats = joblib.load(os.path.join(BASE_DIR, "z_stats_v4.pkl"))
+calib = joblib.load(os.path.join(BASE_DIR, "calibration_v4.pkl"))
 
 BUFFER = deque(maxlen=20)
 
-BASE_FEATURES = ["cpu_usage","cpu_temp","gpu_temp","power","cpu_freq"]
+BASE_FEATURES = ["cpu_usage", "cpu_temp", "gpu_temp", "power", "cpu_freq"]
 
-import math
 
 def compute_score(z_abs):
-    # log-based scaling (stable)
     score = math.log1p(z_abs) * 40
     return min(score, 100)
+
 
 def get_health(score):
     if score < 35:
@@ -30,44 +33,54 @@ def get_health(score):
         return "Degrading"
     else:
         return "Critical"
-        
+
+
 @app.route("/health", methods=["GET"])
 def health():
-    return {"status": "ok"}, 200
-    
+    return jsonify({"status": "ok"}), 200
+
+
 @app.route("/predict", methods=["POST"])
 def predict():
-    data = request.json
-    df = pd.DataFrame([data])
+    try:
+        data = request.json
 
-    # digital twin
-    df["predicted_fan"] = reg.predict(df[BASE_FEATURES])
+        if not data:
+            return jsonify({"error": "No JSON body received"}), 400
 
-    df["fan_error"] = df["fan1"] - df["predicted_fan"]
+        missing = [f for f in BASE_FEATURES + ["fan1"] if f not in data]
+        if missing:
+            return jsonify({"error": f"Missing fields: {missing}"}), 400
 
-    # load stats
-    load = data.get("load", "MED")  # default fallback
-    row = stats[stats["load"] == load].iloc[0]
+        df = pd.DataFrame([data])
 
-    z = (df["fan_error"][0] - row["mu"]) / row["sigma"]
-    z = np.clip(z, -5, 5)
-    z_abs = abs(z)
+        df["predicted_fan"] = reg.predict(df[BASE_FEATURES])
+        df["fan_error"] = df["fan1"] - df["predicted_fan"]
 
-    score = compute_score(z_abs)
-    # score = (z_abs / 5) * 100
-    health = get_health(score)
+        load = data.get("load", "MED")
+        matched = stats[stats["load"] == load]
+        if matched.empty:
+            return jsonify({"error": f"Unknown load value: {load}"}), 400
 
-    return jsonify({
-        "predicted_fan": float(df["predicted_fan"][0]),
-        "fan_error": float(df["fan_error"][0]),
-        "z_score": float(z),
-        "anomaly_score": float(score),
-        "health": health
-    })
+        row = matched.iloc[0]
+        z = (df["fan_error"][0] - row["mu"]) / row["sigma"]
+        z = np.clip(z, -5, 5)
+        z_abs = abs(z)
+
+        score = compute_score(z_abs)
+        health_status = get_health(score)
+
+        return jsonify({
+            "predicted_fan": float(df["predicted_fan"][0]),
+            "fan_error":     float(df["fan_error"][0]),
+            "z_score":       float(z),
+            "anomaly_score": float(score),
+            "health":        health_status
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
-# =========================
-# RUN
-# =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
