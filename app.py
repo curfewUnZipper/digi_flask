@@ -4,27 +4,27 @@ import pandas as pd
 import numpy as np
 import joblib
 from collections import deque
-import math
+from datetime import datetime
 import os
+import math
 
 app = Flask(__name__)
 CORS(app)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-reg   = joblib.load(os.path.join(BASE_DIR, "fan_regressor_v4.pkl"))
-stats = joblib.load(os.path.join(BASE_DIR, "z_stats_v4.pkl"))
-calib = joblib.load(os.path.join(BASE_DIR, "calibration_v4.pkl"))
+reg = joblib.load("fan_regressor_v4.pkl")
+stats = joblib.load("z_stats_v4.pkl")
+calib = joblib.load("calibration_v4.pkl")
 
 BUFFER = deque(maxlen=20)
 
-BASE_FEATURES = ["cpu_usage", "cpu_temp", "gpu_temp", "power", "cpu_freq"]
+BASE_FEATURES = ["cpu_usage","cpu_temp","gpu_temp","power","cpu_freq"]
+
+CSV_FILE = "logs.csv"
 
 
 def compute_score(z_abs):
     score = math.log1p(z_abs) * 40
     return min(score, 100)
-
 
 def get_health(score):
     if score < 35:
@@ -35,52 +35,140 @@ def get_health(score):
         return "Critical"
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
-
-
 @app.route("/predict", methods=["POST"])
 def predict():
+    data = request.json
+
+    # ✅ device handling
+    device_id = data.get("device_id", "frontend")
+
+    # ✅ timestamp
+    timestamp = datetime.utcnow().isoformat()
+
+    df = pd.DataFrame([data])
+
+    # digital twin
+    df["predicted_fan"] = reg.predict(df[BASE_FEATURES])
+
+    df["fan_error"] = df["fan1"] - df["predicted_fan"]
+
+    # load stats
+    load = data.get("load", "MED")
+    row = stats[stats["load"] == load].iloc[0]
+
+    z = (df["fan_error"][0] - row["mu"]) / row["sigma"]
+    z = np.clip(z, -5, 5)
+    z_abs = abs(z)
+
+    score = compute_score(z_abs)
+    health = get_health(score)
+
+    # =========================
+    # 📦 SAVE TO CSV
+    # =========================
+    log_entry = {
+        "timestamp": timestamp,
+        "device_id": device_id,
+        **data,  # all incoming data
+        "predicted_fan": float(df["predicted_fan"][0]),
+        "fan_error": float(df["fan_error"][0]),
+        "z_score": float(z),
+        "anomaly_score": float(score),
+        "health": health
+    }
+
+    log_df = pd.DataFrame([log_entry])
+
+    # append safely
+    if not os.path.exists(CSV_FILE):
+        log_df.to_csv(CSV_FILE, index=False)
+    else:
+        log_df.to_csv(CSV_FILE, mode='a', header=False, index=False)
+
+    # =========================
+
+    return jsonify({
+        "predicted_fan": float(df["predicted_fan"][0]),
+        "fan_error": float(df["fan_error"][0]),
+        "z_score": float(z),
+        "anomaly_score": float(score),
+        "health": health
+    })
+
+
+@app.route("/predict_series", methods=["POST"])
+def predict_series():
     try:
-        data = request.json
+        data = request.json  # expects list of dicts
 
-        if not data:
-            return jsonify({"error": "No JSON body received"}), 400
+        if not isinstance(data, list):
+            return jsonify({"error": "Expected a list of data points"}), 400
 
-        missing = [f for f in BASE_FEATURES + ["fan1"] if f not in data]
-        if missing:
-            return jsonify({"error": f"Missing fields: {missing}"}), 400
+        df = pd.DataFrame(data)
 
-        df = pd.DataFrame([data])
+        # check required columns
+        for col in BASE_FEATURES + ["fan1"]:
+            if col not in df.columns:
+                return jsonify({"error": f"Missing column: {col}"}), 400
 
+        # predictions
         df["predicted_fan"] = reg.predict(df[BASE_FEATURES])
         df["fan_error"] = df["fan1"] - df["predicted_fan"]
 
-        load = data.get("load", "MED")
-        matched = stats[stats["load"] == load]
-        if matched.empty:
-            return jsonify({"error": f"Unknown load value: {load}"}), 400
+        results = []
 
-        row = matched.iloc[0]
-        z = (df["fan_error"][0] - row["mu"]) / row["sigma"]
-        z = np.clip(z, -5, 5)
-        z_abs = abs(z)
+        for i in range(len(df)):
+            load = df.iloc[i].get("load", "MED")
 
-        score = compute_score(z_abs)
-        health_status = get_health(score)
+            row = stats[stats["load"] == load].iloc[0]
+
+            z = (df.iloc[i]["fan_error"] - row["mu"]) / row["sigma"]
+            z = np.clip(z, -5, 5)
+            z_abs = abs(z)
+
+            score = compute_score(z_abs)
+            health = get_health(score)
+
+            results.append({
+                "predicted_fan": float(df.iloc[i]["predicted_fan"]),
+                "fan_error": float(df.iloc[i]["fan_error"]),
+                "z_score": float(z),
+                "anomaly_score": float(score),
+                "health": health
+            })
 
         return jsonify({
-            "predicted_fan": float(df["predicted_fan"][0]),
-            "fan_error":     float(df["fan_error"][0]),
-            "z_score":       float(z),
-            "anomaly_score": float(score),
-            "health":        health_status
+            "count": len(results),
+            "results": results
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e)})
+    
+    
+@app.route("/logs", methods=["GET"])
+def get_logs():
+    try:
+        # query params
+        offset = int(request.args.get("offset", 0))
+        limit = int(request.args.get("limit", 10))
+
+        df = pd.read_csv("logs.csv")
+
+        total_rows = len(df)
+
+        # slice data
+        sliced = df.iloc[offset:offset+limit]
+
+        return jsonify({
+            "data": sliced.to_dict(orient="records"),
+            "next_offset": offset + len(sliced),
+            "total_rows": total_rows
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True) 
