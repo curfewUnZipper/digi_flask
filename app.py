@@ -18,14 +18,12 @@ import onnxruntime as ort
 # LOAD ENV VARIABLES
 # =========================================================
 
-load_dotenv()
+# load_dotenv()
 
 # SUPABASE_URL = os.getenv("SUPABASE_URL")
 # SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-print(SUPABASE_URL)
-print(SUPABASE_KEY[:20])
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
@@ -40,8 +38,9 @@ CORS(app)
 # =========================================================
 # LOAD MODEL + SCALER
 # =========================================================
-MODEL_PATH = "model.onnx"
-SCALER_PATH = "scaler.pkl"
+BASE_DIR = os.path.dirname(__file__)
+MODEL_PATH = os.path.join(BASE_DIR, "model.onnx")
+SCALER_PATH = os.path.join(BASE_DIR, "scaler.pkl")
 
 print("[INFO] Loading ONNX model...")
 
