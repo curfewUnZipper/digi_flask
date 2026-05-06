@@ -5,7 +5,7 @@ from collections import deque
 from datetime import datetime
 
 from supabase import create_client
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 
 import numpy as np
 import joblib
@@ -20,8 +20,10 @@ import onnxruntime as ort
 
 load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# SUPABASE_URL = os.getenv("SUPABASE_URL")
+# SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 print(SUPABASE_URL)
 print(SUPABASE_KEY[:20])
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
