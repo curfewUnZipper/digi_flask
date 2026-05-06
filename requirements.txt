@@ -1,6 +1,8 @@
-flask
-flask-cors
+onnxruntime
 pandas
 numpy
-joblib
 scikit-learn
+matplotlib
+joblib
+supabase
+python-dotenv

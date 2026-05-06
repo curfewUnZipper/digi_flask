@@ -1,174 +1,396 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import pandas as pd
-import numpy as np
-import joblib
+
 from collections import deque
 from datetime import datetime
+
+from supabase import create_client
+from dotenv import load_dotenv
+
+import numpy as np
+import joblib
 import os
-import math
+import time
+
+import onnxruntime as ort
+
+# =========================================================
+# LOAD ENV VARIABLES
+# =========================================================
+
+load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+print(SUPABASE_URL)
+print(SUPABASE_KEY[:20])
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+# =========================================================
+# FLASK APP
+# =========================================================
 
 app = Flask(__name__)
 CORS(app)
 
-reg = joblib.load("fan_regressor_v4.pkl")
-stats = joblib.load("z_stats_v4.pkl")
-calib = joblib.load("calibration_v4.pkl")
 
-BUFFER = deque(maxlen=20)
+# =========================================================
+# LOAD MODEL + SCALER
+# =========================================================
+MODEL_PATH = "model.onnx"
+SCALER_PATH = "scaler.pkl"
 
-BASE_FEATURES = ["cpu_usage","cpu_temp","gpu_temp","power","cpu_freq"]
+print("[INFO] Loading ONNX model...")
 
-CSV_FILE = "logs.csv"
+session = ort.InferenceSession(MODEL_PATH)
+
+input_name = session.get_inputs()[0].name
+
+print("[INFO] Loading scaler...")
+scaler = joblib.load(SCALER_PATH)
+
+print("[INFO] Model and scaler loaded successfully")
+
+# =========================================================
+# GLOBAL BUFFER
+# =========================================================
+
+WINDOW_SIZE = 20
+
+telemetry_buffer = deque(maxlen=WINDOW_SIZE)
+
+# For simple degradation tracking
+residual_history = deque(maxlen=100)
 
 
-def compute_score(z_abs):
-    score = math.log1p(z_abs) * 40
-    return min(score, 100)
+# =========================================================
+# HEALTH LOGIC
+# =========================================================
 
-def get_health(score):
-    if score < 35:
-        return "Normal"
-    elif score < 70:
-        return "Degrading"
-    else:
-        return "Critical"
+def compute_health_index(residual):
+
+    # Simple normalized degradation logic
+    normalized = min(residual / 1000, 1.0)
+
+    health_index = max(0.0, 1.0 - normalized)
+
+    return round(health_index, 3)
 
 
-@app.route("/predict", methods=["POST"])
-def predict():
-    data = request.json
+def classify_health(health_index):
 
-    # ✅ device handling
-    device_id = data.get("device_id", "frontend")
+    if health_index >= 0.8:
+        return "HEALTHY"
 
-    # ✅ timestamp
-    timestamp = datetime.utcnow().isoformat()
+    elif health_index >= 0.5:
+        return "MINOR"
 
-    df = pd.DataFrame([data])
+    elif health_index >= 0.2:
+        return "MODERATE"
 
-    # digital twin
-    df["predicted_fan"] = reg.predict(df[BASE_FEATURES])
+    return "CRITICAL"
 
-    df["fan_error"] = df["fan1"] - df["predicted_fan"]
 
-    # load stats
-    load = data.get("load", "MED")
-    row = stats[stats["load"] == load].iloc[0]
+def estimate_rul(health_index):
 
-    z = (df["fan_error"][0] - row["mu"]) / row["sigma"]
-    z = np.clip(z, -5, 5)
-    z_abs = abs(z)
+    # Simple RUL estimation
+    rul = int(health_index * 200)
 
-    score = compute_score(z_abs)
-    health = get_health(score)
+    return max(rul, 0)
 
-    # =========================
-    # 📦 SAVE TO CSV
-    # =========================
-    log_entry = {
-        "timestamp": timestamp,
-        "device_id": device_id,
-        **data,  # all incoming data
-        "predicted_fan": float(df["predicted_fan"][0]),
-        "fan_error": float(df["fan_error"][0]),
-        "z_score": float(z),
-        "anomaly_score": float(score),
-        "health": health
-    }
 
-    log_df = pd.DataFrame([log_entry])
+def compute_trend():
 
-    # append safely
-    if not os.path.exists(CSV_FILE):
-        log_df.to_csv(CSV_FILE, index=False)
-    else:
-        log_df.to_csv(CSV_FILE, mode='a', header=False, index=False)
+    if len(residual_history) < 2:
+        return 0.0
 
-    # =========================
+    x = np.arange(len(residual_history))
+    y = np.array(residual_history)
+
+    slope = np.polyfit(x, y, 1)[0]
+
+    return round(float(slope), 6)
+
+
+# =========================================================
+# ROOT
+# =========================================================
+
+@app.route("/")
+def home():
 
     return jsonify({
-        "predicted_fan": float(df["predicted_fan"][0]),
-        "fan_error": float(df["fan_error"][0]),
-        "z_score": float(z),
-        "anomaly_score": float(score),
-        "health": health
+        "status": "online",
+        "service": "Predictive Maintenance Digital Twin API"
     })
 
 
-@app.route("/predict_series", methods=["POST"])
-def predict_series():
+# =========================================================
+# TELEMETRY INGESTION
+# =========================================================
+
+@app.route("/telemetry", methods=["POST"])
+def telemetry():
+
     try:
-        data = request.json  # expects list of dicts
 
-        if not isinstance(data, list):
-            return jsonify({"error": "Expected a list of data points"}), 400
+        start_time = time.time()
 
-        df = pd.DataFrame(data)
+        data = request.json
 
-        # check required columns
-        for col in BASE_FEATURES + ["fan1"]:
-            if col not in df.columns:
-                return jsonify({"error": f"Missing column: {col}"}), 400
+        # -------------------------------------------------
+        # INPUTS
+        # -------------------------------------------------
 
-        # predictions
-        df["predicted_fan"] = reg.predict(df[BASE_FEATURES])
-        df["fan_error"] = df["fan1"] - df["predicted_fan"]
+        cpu_usage = float(data["cpu_usage"])
+        temperature = float(data["temperature"])
+        power = float(data["power"])
+        frequency = float(data["frequency"])
+        fan_rpm = float(data["fan_rpm"])
 
-        results = []
+        timestamp = data.get(
+            "timestamp",
+            datetime.utcnow().isoformat()
+        )
 
-        for i in range(len(df)):
-            load = df.iloc[i].get("load", "MED")
+        # -------------------------------------------------
+        # PREPARE INPUT
+        # -------------------------------------------------
 
-            row = stats[stats["load"] == load].iloc[0]
+        features = np.array([[
+            cpu_usage,
+            temperature,
+            power,
+            frequency,
+            fan_rpm
+        ]])
 
-            z = (df.iloc[i]["fan_error"] - row["mu"]) / row["sigma"]
-            z = np.clip(z, -5, 5)
-            z_abs = abs(z)
+        scaled_features = scaler.transform(features)
 
-            score = compute_score(z_abs)
-            health = get_health(score)
+        telemetry_buffer.append(scaled_features[0])
 
-            results.append({
-                "predicted_fan": float(df.iloc[i]["predicted_fan"]),
-                "fan_error": float(df.iloc[i]["fan_error"]),
-                "z_score": float(z),
-                "anomaly_score": float(score),
-                "health": health
+        # -------------------------------------------------
+        # WAIT FOR BUFFER
+        # -------------------------------------------------
+
+        if len(telemetry_buffer) < WINDOW_SIZE:
+
+            return jsonify({
+                "status": "buffering",
+                "message": f"Collecting telemetry window ({len(telemetry_buffer)}/{WINDOW_SIZE})"
             })
 
+        # -------------------------------------------------
+        # CREATE SEQUENCE
+        # -------------------------------------------------
+
+        sequence = np.array(telemetry_buffer)
+
+        sequence = sequence.reshape(
+            1,
+            WINDOW_SIZE,
+            scaled_features.shape[1]
+        ).astype(np.float32)
+
+        # -------------------------------------------------
+        # ONNX INFERENCE
+        # -------------------------------------------------
+
+        # ONNX INFERENCE
+
+        prediction = session.run(
+            None,
+            {
+                input_name: sequence.astype(np.float32)
+            }
+        )
+
+        predicted_rpm = float(prediction[0][0][0])
+
+        # -------------------------------------------------
+        # RESIDUAL ANALYSIS
+        # -------------------------------------------------
+
+        residual = abs(predicted_rpm - fan_rpm)
+
+        residual_history.append(residual)
+
+        health_index = compute_health_index(residual)
+
+        health_state = classify_health(health_index)
+
+        estimated_rul = estimate_rul(health_index)
+
+        trend_slope = compute_trend()
+
+        inference_time_ms = round(
+            (time.time() - start_time) * 1000,
+            2
+        )
+
+        # -------------------------------------------------
+        # STORE IN SUPABASE
+        # -------------------------------------------------
+
+        payload = {
+            "timestamp": timestamp,
+
+            "cpu_usage": cpu_usage,
+            "temperature": temperature,
+            "power": power,
+            "frequency": frequency,
+            "fan_rpm": fan_rpm,
+
+            "predicted_rpm": predicted_rpm,
+            "residual": residual,
+
+            "health_index": health_index,
+            "health_state": health_state,
+
+            "estimated_rul": estimated_rul,
+            "trend_slope": trend_slope,
+
+            "inference_time_ms": inference_time_ms
+        }
+
+        supabase.table("telemetry_logs").insert(payload).execute()
+
+        # -------------------------------------------------
+        # RESPONSE
+        # -------------------------------------------------
+
         return jsonify({
-            "count": len(results),
-            "results": results
+
+            "status": "success",
+
+            "telemetry": {
+                "cpu_usage": cpu_usage,
+                "temperature": temperature,
+                "power": power,
+                "frequency": frequency,
+                "fan_rpm": fan_rpm
+            },
+
+            "prediction": {
+                "predicted_rpm": round(predicted_rpm, 2),
+                "actual_rpm": fan_rpm,
+                "residual": round(residual, 2)
+            },
+
+            "health": {
+                "health_index": health_index,
+                "health_state": health_state
+            },
+
+            "forecast": {
+                "estimated_rul": estimated_rul,
+                "trend_slope": trend_slope
+            },
+
+            "system": {
+                "inference_time_ms": inference_time_ms
+            }
+
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)})
-    
-    
-@app.route("/logs", methods=["GET"])
-def get_logs():
+
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+
+# =========================================================
+# GET HISTORY
+# =========================================================
+
+@app.route("/history", methods=["GET"])
+def history():
+
     try:
-        # query params
-        offset = int(request.args.get("offset", 0))
-        limit = int(request.args.get("limit", 10))
 
-        df = pd.read_csv("logs.csv")
+        response = (
+            supabase
+            .table("telemetry_logs")
+            .select("*")
+            .order("timestamp", desc=True)
+            .limit(200)
+            .execute()
+        )
 
-        total_rows = len(df)
+        return jsonify(response.data)
 
-        # slice data
-        sliced = df.iloc[offset:offset+limit]
+    except Exception as e:
 
         return jsonify({
-            "data": sliced.to_dict(orient="records"),
-            "next_offset": offset + len(sliced),
-            "total_rows": total_rows
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+
+# =========================================================
+# SUMMARY
+# =========================================================
+
+@app.route("/summary", methods=["GET"])
+def summary():
+
+    try:
+
+        response = (
+            supabase
+            .table("telemetry_logs")
+            .select("*")
+            .order("timestamp", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if not response.data:
+
+            return jsonify({
+                "status": "no_data"
+            })
+
+        latest = response.data[0]
+
+        return jsonify({
+
+            "current_health_index":
+                latest["health_index"],
+
+            "current_rul":
+                latest["estimated_rul"],
+
+            "health_state":
+                latest["health_state"],
+
+            "latest_residual":
+                latest["residual"],
+
+            "trend_slope":
+                latest["trend_slope"]
+
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)})
 
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+
+# =========================================================
+# RUN SERVER
+# =========================================================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True) 
+
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=True
+    )
