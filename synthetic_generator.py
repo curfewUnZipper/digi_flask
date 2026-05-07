@@ -33,10 +33,15 @@ def degrade_dataset(df, level):
     # Aging parameters
     # ---------------------------------------
 
-    temp_increase = level * 8
-    rpm_efficiency_loss = level * 0.15
-    response_lag = level * 0.4
-    noise_strength = level * 200
+    temp_increase = level * 10
+
+    rpm_efficiency_loss = level * 0.12
+
+    response_lag = level * 0.35
+
+    rpm_noise = level * 4
+
+    thermal_noise = level * 2
 
     # ---------------------------------------
     # Increase temperatures
@@ -45,11 +50,15 @@ def degrade_dataset(df, level):
     degraded["temperature"] = (
         degraded["temperature"]
         + temp_increase
-        + np.random.normal(0, level * 1.5, len(df))
+        + np.random.normal(
+            0,
+            thermal_noise,
+            len(df)
+        )
     )
 
     # ---------------------------------------
-    # Simulate thermal lag
+    # Thermal lag
     # ---------------------------------------
 
     degraded["temperature"] = apply_thermal_lag(
@@ -58,7 +67,7 @@ def degrade_dataset(df, level):
     )
 
     # ---------------------------------------
-    # Fan loses efficiency
+    # Fan efficiency reduction
     # ---------------------------------------
 
     degraded["fan_rpm"] = (
@@ -73,28 +82,35 @@ def degrade_dataset(df, level):
     rpm = degraded["fan_rpm"].values.copy()
 
     for i in range(1, len(rpm)):
+
         rpm[i] = (
-            0.85 * rpm[i - 1]
-            + 0.15 * rpm[i]
+            0.9 * rpm[i - 1]
+            + 0.1 * rpm[i]
         )
 
     degraded["fan_rpm"] = rpm
 
     # ---------------------------------------
-    # Add instability/noise
+    # RPM instability
     # ---------------------------------------
 
     degraded["fan_rpm"] += np.random.normal(
         0,
-        noise_strength,
+        rpm_noise,
         len(df)
     )
 
-    degraded["temperature"] += np.random.normal(
-        0,
-        level,
-        len(df)
-    )
+    # ---------------------------------------
+    # Clamp values
+    # ---------------------------------------
+
+    degraded["fan_rpm"] = degraded[
+        "fan_rpm"
+    ].clip(0, 100)
+
+    degraded["temperature"] = degraded[
+        "temperature"
+    ].clip(0, 100)
 
     return degraded
 
