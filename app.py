@@ -320,30 +320,32 @@ def telemetry():
             "message": str(e)
         }), 500
 
-# -------------------------------------------------
-# STORE RAW TELEMETRY
-# -------------------------------------------------
+# =========================================================
+# GET RAW TELEMETRY
+# =========================================================
 
-raw_payload = {
+@app.route("/telemetry", methods=["GET"])
+def get_telemetry():
 
-    "timestamp": timestamp,
+    try:
 
-    "cpu_usage": cpu_usage,
-    "temperature": temperature,
-    "power": power,
-    "frequency": frequency,
-    "fan_rpm": fan_rpm,
+        response = (
+            supabase
+            .table("raw_telemetry")
+            .select("*")
+            .order("timestamp", desc=True)
+            .limit(200)
+            .execute()
+        )
 
-    "load": data.get("load", "UNKNOWN")
-}
+        return jsonify(response.data)
 
-supabase.table(
-    "raw_telemetry"
-).insert(raw_payload).execute()
+    except Exception as e:
 
-
-
-
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
 
 # =========================================================
 # GET HISTORY
