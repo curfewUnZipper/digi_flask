@@ -222,7 +222,20 @@ def telemetry():
             }
         )
 
-        predicted_rpm = float(prediction[0][0][0])
+        pred_scaled = float(prediction[0][0][0])
+
+        # -------------------------------------------------
+        # INVERSE SCALE RPM
+        # -------------------------------------------------
+
+        dummy = np.zeros((1, 5))
+
+        # fan_rpm index = 4
+        dummy[0, 4] = pred_scaled
+
+        inverse = scaler.inverse_transform(dummy)
+
+        predicted_rpm = float(inverse[0, 4])
 
         # -------------------------------------------------
         # RESIDUAL ANALYSIS
