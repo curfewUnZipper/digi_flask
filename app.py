@@ -1,9 +1,11 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+from collections import deque
 from datetime import datetime
 
 from supabase import create_client
+from dotenv import load_dotenv
 
 import numpy as np
 import joblib
@@ -12,18 +14,17 @@ import time
 
 import onnxruntime as ort
 
-
 # =========================================================
-# ENV VARIABLES
+# LOAD ENV VARIABLES
 # =========================================================
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+load_dotenv()
 
-supabase = create_client(
-    SUPABASE_URL,
-    SUPABASE_KEY
-)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+print(SUPABASE_URL)
+print(SUPABASE_KEY[:20])
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # =========================================================
@@ -35,15 +36,10 @@ CORS(app)
 
 
 # =========================================================
-# MODEL + SCALER
+# LOAD MODEL + SCALER
 # =========================================================
-
-BASE_DIR = os.path.dirname(__file__)
-
-MODEL_PATH = os.path.join(BASE_DIR, "model.onnx")
-SCALER_PATH = os.path.join(BASE_DIR, "scaler.pkl")
-
-WINDOW_SIZE = 20
+MODEL_PATH = "model.onnx"
+SCALER_PATH = "scaler.pkl"
 
 print("[INFO] Loading ONNX model...")
 
@@ -52,10 +48,20 @@ session = ort.InferenceSession(MODEL_PATH)
 input_name = session.get_inputs()[0].name
 
 print("[INFO] Loading scaler...")
-
 scaler = joblib.load(SCALER_PATH)
 
-print("[INFO] Backend initialized successfully")
+print("[INFO] Model and scaler loaded successfully")
+
+# =========================================================
+# GLOBAL BUFFER
+# =========================================================
+
+WINDOW_SIZE = 20
+
+telemetry_buffer = deque(maxlen=WINDOW_SIZE)
+
+# For simple degradation tracking
+residual_history = deque(maxlen=100)
 
 
 # =========================================================
@@ -64,6 +70,7 @@ print("[INFO] Backend initialized successfully")
 
 def compute_health_index(residual):
 
+    # Simple normalized degradation logic
     normalized = min(residual / 1000, 1.0)
 
     health_index = max(0.0, 1.0 - normalized)
@@ -87,16 +94,19 @@ def classify_health(health_index):
 
 def estimate_rul(health_index):
 
-    return max(0, int(health_index * 200))
+    # Simple RUL estimation
+    rul = int(health_index * 200)
+
+    return max(rul, 0)
 
 
-def compute_trend(residuals):
+def compute_trend():
 
-    if len(residuals) < 2:
+    if len(residual_history) < 2:
         return 0.0
 
-    x = np.arange(len(residuals))
-    y = np.array(residuals)
+    x = np.arange(len(residual_history))
+    y = np.array(residual_history)
 
     slope = np.polyfit(x, y, 1)[0]
 
@@ -112,12 +122,12 @@ def home():
 
     return jsonify({
         "status": "online",
-        "service": "Predictive Maintenance API"
+        "service": "Predictive Maintenance Digital Twin API"
     })
 
 
 # =========================================================
-# TELEMETRY ENDPOINT
+# TELEMETRY INGESTION
 # =========================================================
 
 @app.route("/telemetry", methods=["POST"])
@@ -143,7 +153,6 @@ def telemetry():
             "timestamp",
             datetime.utcnow().isoformat()
         )
-
         # -------------------------------------------------
         # STORE RAW TELEMETRY
         # -------------------------------------------------
@@ -156,117 +165,83 @@ def telemetry():
             "temperature": temperature,
             "power": power,
             "frequency": frequency,
-            "fan_rpm": fan_rpm
+            "fan_rpm": fan_rpm,
+
+            "load": data.get("load", "UNKNOWN")
         }
 
         supabase.table(
-            "telemetry_logs"
+            "raw_telemetry"
         ).insert(raw_payload).execute()
-
         # -------------------------------------------------
-        # FETCH LAST 20 ROWS
-        # -------------------------------------------------
-
-        response = (
-            supabase
-            .table("telemetry_logs")
-            .select("*")
-            .order("timestamp", desc=True)
-            .limit(WINDOW_SIZE)
-            .execute()
-        )
-
-        rows = list(reversed(response.data))
-
-        # -------------------------------------------------
-        # WAIT FOR WINDOW
+        # PREPARE INPUT
         # -------------------------------------------------
 
-        if len(rows) < WINDOW_SIZE:
+        features = np.array([[
+            cpu_usage,
+            temperature,
+            power,
+            frequency,
+            fan_rpm
+        ]])
+
+        scaled_features = scaler.transform(features)
+
+        telemetry_buffer.append(scaled_features[0])
+
+        # -------------------------------------------------
+        # WAIT FOR BUFFER
+        # -------------------------------------------------
+
+        if len(telemetry_buffer) < WINDOW_SIZE:
 
             return jsonify({
                 "status": "buffering",
-                "message":
-                    f"Collecting telemetry window ({len(rows)}/{WINDOW_SIZE})"
+                "message": f"Collecting telemetry window ({len(telemetry_buffer)}/{WINDOW_SIZE})"
             })
 
         # -------------------------------------------------
-        # BUILD SEQUENCE
+        # CREATE SEQUENCE
         # -------------------------------------------------
 
-        sequence_data = []
+        sequence = np.array(telemetry_buffer)
 
-        for row in rows:
-
-            sequence_data.append([
-                row["cpu_usage"],
-                row["temperature"],
-                row["power"],
-                row["frequency"],
-                row["fan_rpm"]
-            ])
-
-        # -------------------------------------------------
-        # SCALE FEATURES
-        # -------------------------------------------------
-
-        scaled_sequence = scaler.transform(sequence_data)
-
-        sequence = np.array(
-            scaled_sequence
-        ).reshape(
+        sequence = sequence.reshape(
             1,
             WINDOW_SIZE,
-            5
+            scaled_features.shape[1]
         ).astype(np.float32)
 
         # -------------------------------------------------
         # ONNX INFERENCE
         # -------------------------------------------------
 
+        # ONNX INFERENCE
+
         prediction = session.run(
             None,
             {
-                input_name: sequence
+                input_name: sequence.astype(np.float32)
             }
         )
 
-        predicted_rpm = float(
-            prediction[0][0][0]
-        )
+        predicted_rpm = float(prediction[0][0][0])
 
         # -------------------------------------------------
         # RESIDUAL ANALYSIS
         # -------------------------------------------------
 
-        residual = abs(
-            predicted_rpm - fan_rpm
-        )
+        residual = abs(predicted_rpm - fan_rpm)
 
-        residuals = []
+        residual_history.append(residual)
 
-        for row in rows:
+        health_index = compute_health_index(residual)
 
-            if row.get("residual") is not None:
-                residuals.append(row["residual"])
+        health_state = classify_health(health_index)
 
-        residuals.append(residual)
+        estimated_rul = estimate_rul(health_index)
 
-        health_index = compute_health_index(
-            residual
-        )
-
-        health_state = classify_health(
-            health_index
-        )
-
-        estimated_rul = estimate_rul(
-            health_index
-        )
-
-        trend_slope = compute_trend(
-            residuals
-        )
+        trend_slope = compute_trend()
 
         inference_time_ms = round(
             (time.time() - start_time) * 1000,
@@ -274,42 +249,31 @@ def telemetry():
         )
 
         # -------------------------------------------------
-        # UPDATE LATEST ROW
+        # STORE IN SUPABASE
         # -------------------------------------------------
 
-        latest_id = rows[-1]["id"]
+        payload = {
+            "timestamp": timestamp,
 
-        update_payload = {
+            "cpu_usage": cpu_usage,
+            "temperature": temperature,
+            "power": power,
+            "frequency": frequency,
+            "fan_rpm": fan_rpm,
 
-            "predicted_rpm":
-                predicted_rpm,
+            "predicted_rpm": predicted_rpm,
+            "residual": residual,
 
-            "residual":
-                residual,
+            "health_index": health_index,
+            "health_state": health_state,
 
-            "health_index":
-                health_index,
+            "estimated_rul": estimated_rul,
+            "trend_slope": trend_slope,
 
-            "health_state":
-                health_state,
-
-            "estimated_rul":
-                estimated_rul,
-
-            "trend_slope":
-                trend_slope,
-
-            "inference_time_ms":
-                inference_time_ms
+            "inference_time_ms": inference_time_ms
         }
 
-        (
-            supabase
-            .table("telemetry_logs")
-            .update(update_payload)
-            .eq("id", latest_id)
-            .execute()
-        )
+        supabase.table("telemetry_logs").insert(payload).execute()
 
         # -------------------------------------------------
         # RESPONSE
@@ -320,57 +284,31 @@ def telemetry():
             "status": "success",
 
             "telemetry": {
-
-                "cpu_usage":
-                    cpu_usage,
-
-                "temperature":
-                    temperature,
-
-                "power":
-                    power,
-
-                "frequency":
-                    frequency,
-
-                "fan_rpm":
-                    fan_rpm
+                "cpu_usage": cpu_usage,
+                "temperature": temperature,
+                "power": power,
+                "frequency": frequency,
+                "fan_rpm": fan_rpm
             },
 
             "prediction": {
-
-                "predicted_rpm":
-                    round(predicted_rpm, 2),
-
-                "actual_rpm":
-                    fan_rpm,
-
-                "residual":
-                    round(residual, 2)
+                "predicted_rpm": round(predicted_rpm, 2),
+                "actual_rpm": fan_rpm,
+                "residual": round(residual, 2)
             },
 
             "health": {
-
-                "health_index":
-                    health_index,
-
-                "health_state":
-                    health_state
+                "health_index": health_index,
+                "health_state": health_state
             },
 
             "forecast": {
-
-                "estimated_rul":
-                    estimated_rul,
-
-                "trend_slope":
-                    trend_slope
+                "estimated_rul": estimated_rul,
+                "trend_slope": trend_slope
             },
 
             "system": {
-
-                "inference_time_ms":
-                    inference_time_ms
+                "inference_time_ms": inference_time_ms
             }
 
         })
@@ -382,9 +320,33 @@ def telemetry():
             "message": str(e)
         }), 500
 
+# -------------------------------------------------
+# STORE RAW TELEMETRY
+# -------------------------------------------------
+
+raw_payload = {
+
+    "timestamp": timestamp,
+
+    "cpu_usage": cpu_usage,
+    "temperature": temperature,
+    "power": power,
+    "frequency": frequency,
+    "fan_rpm": fan_rpm,
+
+    "load": data.get("load", "UNKNOWN")
+}
+
+supabase.table(
+    "raw_telemetry"
+).insert(raw_payload).execute()
+
+
+
+
 
 # =========================================================
-# HISTORY
+# GET HISTORY
 # =========================================================
 
 @app.route("/history", methods=["GET"])
@@ -440,19 +402,20 @@ def summary():
         return jsonify({
 
             "current_health_index":
-                latest.get("health_index"),
+                latest["health_index"],
 
             "current_rul":
-                latest.get("estimated_rul"),
+                latest["estimated_rul"],
 
             "health_state":
-                latest.get("health_state"),
+                latest["health_state"],
 
             "latest_residual":
-                latest.get("residual"),
+                latest["residual"],
 
             "trend_slope":
-                latest.get("trend_slope")
+                latest["trend_slope"]
+
         })
 
     except Exception as e:
@@ -464,16 +427,13 @@ def summary():
 
 
 # =========================================================
-# START
+# RUN SERVER
 # =========================================================
 
 if __name__ == "__main__":
 
-    port = int(
-        os.environ.get("PORT", 5000)
-    )
-
     app.run(
         host="0.0.0.0",
-        port=port
+        port=5000,
+        debug=True
     )
