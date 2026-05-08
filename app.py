@@ -5,7 +5,6 @@ from collections import deque
 from datetime import datetime
 
 from supabase import create_client
-from dotenv import load_dotenv
 
 import numpy as np
 import joblib
